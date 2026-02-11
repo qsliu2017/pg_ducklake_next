@@ -1,0 +1,7 @@
+pg-17/
+*.o
+*.so
+*.dylib
+*.bc
+.deps/
+.data/
