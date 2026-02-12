@@ -1,3 +1,5 @@
+.PHONY: ducklake clean-ducklake pg_duckdb install_pg_duckdb
+
 MODULE_big = pg_ducklake
 EXTENSION = pg_ducklake
 DATA = pg_ducklake.control $(wildcard sql/pg_ducklake--*.sql)
@@ -69,14 +71,41 @@ endif
 # ---------------------------------------------------------------------------
 include Makefile.global
 
+check-regression:
+	$(MAKE) -C test/regression check-regression
+
+clean-regression:
+	$(MAKE) -C test/regression clean-regression
+
+# ---------------------------------------------------------------------------
+# Submodules
+# ---------------------------------------------------------------------------
+.git/modules/third_party/pg_duckdb/HEAD:
+	git submodule update --init --recursive third_party/pg_duckdb
+
+.git/modules/third_party/ducklake/HEAD:
+	git submodule update --init --depth=1 third_party/ducklake
+
+# ---------------------------------------------------------------------------
+# pg_duckdb
+# ---------------------------------------------------------------------------
+PG_DUCKDB_TARGET = $(PG_DUCKDB_DIR)/pg_duckdb$(DLSUFFIX)
+
+pg_duckdb: $(PG_DUCKDB_TARGET)
+
+$(PG_DUCKDB_TARGET): .git/modules/third_party/pg_duckdb/HEAD
+	DUCKDB_BUILD_TYPE=$(DUCKDB_BUILD_TYPE) \
+	$(MAKE) -C $(PG_DUCKDB_DIR)
+
+install_pg_duckdb: pg_duckdb
+	$(MAKE) -C $(PG_DUCKDB_DIR) install
+
 # ---------------------------------------------------------------------------
 # Build ducklake using its own cmake-based build system
 # ---------------------------------------------------------------------------
-.PHONY: ducklake clean-ducklake
-
 ducklake: $(DUCKLAKE_STATIC_LIB)
 
-$(DUCKLAKE_STATIC_LIB):
+$(DUCKLAKE_STATIC_LIB): .git/modules/third_party/pg_duckdb/HEAD .git/modules/third_party/ducklake/HEAD
 	DUCKDB_SRCDIR=$(DUCKDB_SRC_DIR) \
 	CMAKE_VARS="-DBUILD_SHELL=0 -DBUILD_PYTHON=0 -DBUILD_UNITTESTS=0" \
 	DISABLE_SANITIZER=1 \
@@ -93,6 +122,8 @@ clean-ducklake:
 
 # PG-facing TU uses the default PGXS pattern rule (includes PG server headers).
 # Our PG_CPPFLAGS += $(LOCAL_INCLUDES) adds the bridge header path.
+
+$(OBJS): .git/modules/third_party/pg_duckdb/HEAD
 
 # Shared library depends on ducklake static lib
 $(shlib): $(DUCKLAKE_STATIC_LIB)
