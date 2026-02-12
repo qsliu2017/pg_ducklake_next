@@ -8,11 +8,9 @@ extern "C" {
 #include "postgres.h"
 
 #include "executor/spi.h"
-#include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 
-PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_ducklake_next_verify);
 }
 

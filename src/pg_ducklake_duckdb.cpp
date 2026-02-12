@@ -11,8 +11,6 @@
 #include "duckdb/main/database.hpp"
 #include "ducklake_extension.hpp"
 
-#include "pg_ducklake_bridge.h"
-
 /* Exported by pg_duckdb — returns duckdb::DuckDB* as void* */
 extern "C" void *GetDuckDBDatabase(void);
 
