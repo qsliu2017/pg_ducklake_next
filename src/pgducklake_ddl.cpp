@@ -94,6 +94,9 @@ GenerateCreateTableDDL(Oid relid) {
 }
 
 extern "C" {
+    // Defined in pgducklake_duckdb.cpp
+    extern void ducklake_load_extension(void);
+    
 
 DECLARE_PG_FUNCTION(ducklake_initialize) {
   if (!creating_extension) {
@@ -102,6 +105,9 @@ DECLARE_PG_FUNCTION(ducklake_initialize) {
                            "CREATE EXTENSION")));
   }
 
+  // Load DuckLake extension into pg_duckdb's DuckDB instance at initialization
+  ducklake_load_extension();
+	
   if (pgducklake::PgDuckLakeMetadataManager::IsInitialized()) {
     ereport(
         ERROR,

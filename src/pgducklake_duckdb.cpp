@@ -9,9 +9,12 @@
  */
 
 #include "pgducklake/pgducklake_duckdb.hpp"
+#include "pgducklake/pgducklake_metadata_manager.hpp"
+#include "pgducklake/utility/cpp_wrapper.hpp"
 
 #include "duckdb/main/database.hpp"
 #include "ducklake_extension.hpp"
+#include "storage/ducklake_metadata_manager.hpp"
 
 // Imported from pg_duckdb — returns duckdb::DuckDB* as void*
 extern "C" void *GetDuckDBDatabase(void);
@@ -35,6 +38,7 @@ DuckLakeManager::CreateConnection() {
 int
 DuckLakeManager::ExecuteQuery(const char *query, const char **errmsg_out) {
 	try {
+    	PostgresScopedStackReset scoped_stack_reset;
 		auto conn = CreateConnection();
 		auto result = conn->Query(query);
 
@@ -66,6 +70,7 @@ DuckLakeManager::ExecuteQuery(const char *query, const char **errmsg_out) {
 extern "C" void
 ducklake_load_extension(void) {
 	auto &db = pgducklake::DuckLakeManager::GetDatabase();
+	duckdb::DuckLakeMetadataManager::Register("pgducklake", pgducklake::PgDuckLakeMetadataManager::Create);
 	db.LoadStaticExtension<duckdb::DucklakeExtension>();
 }
 

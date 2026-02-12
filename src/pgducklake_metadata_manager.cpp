@@ -11,6 +11,8 @@
 #include "duckdb/main/materialized_query_result.hpp"
 
 #include "common/ducklake_util.hpp"
+#include "pgducklake/utility/cpp_wrapper.hpp"
+#include <cstring>
 #include <duckdb/common/string_util.hpp>
 
 extern "C" {
@@ -80,15 +82,15 @@ static void InsertSPITupleTableIntoChunk(duckdb::DataChunk &output,
       } else {
         if (attr->attlen == -1) {
           bool should_free = false;
-          // Datum detoasted_value = DetoastPostgresDatum(
-          //     reinterpret_cast<varlena *>(datum), &should_free);
-          // ConvertPostgresToDuckValue(attr->atttypid, detoasted_value, result,
-          //                            row);
-          // if (should_free) {
-          //   duckdb_free(reinterpret_cast<void *>(detoasted_value));
-          // }
+          Datum detoasted_value = DetoastPostgresDatum(
+              reinterpret_cast<varlena *>(datum), &should_free);
+          ConvertPostgresToDuckValue(attr->atttypid, detoasted_value, result,
+                                     row);
+          if (should_free) {
+            duckdb_free(reinterpret_cast<void *>(detoasted_value));
+          }
         } else {
-          // ConvertPostgresToDuckValue(attr->atttypid, datum, result, row);
+          ConvertPostgresToDuckValue(attr->atttypid, datum, result, row);
         }
       }
     }
@@ -99,7 +101,7 @@ static duckdb::unique_ptr<duckdb::QueryResult>
 CreateSPIResult(const duckdb::string &query) {
   elog(DEBUG1, "Creating SPI result for query: %s", query.c_str());
 
-  // PostgresScopedStackReset scoped_stack_reset;
+  PostgresScopedStackReset scoped_stack_reset;
 
   // CommandId cid_before_commit = pg::GetCurrentCommandId();
   SPI_connect();
@@ -157,7 +159,7 @@ CreateSPIResult(const duckdb::string &query) {
     names.push_back(NameStr(attr->attname));
 
     // Convert Postgres type to DuckDB type
-    // types.push_back(ConvertPostgresToDuckColumnType(attr));
+    types.push_back(ConvertPostgresToDuckColumnType(attr));
   }
 
   // Create a ColumnDataCollection to store the results
@@ -254,11 +256,11 @@ bool PgDuckLakeMetadataManager::IsInitialized() {
     const char *relname = NameStr(classForm->relname);
 
     /* Match LIKE 'ducklake_%' */
-    // if (StringHasPrefix(relname, "ducklake_") &&
-    //     classForm->relkind == RELKIND_RELATION) {
-    //   found = true;
-    //   break;
-    // }
+    if (strncmp(relname, "ducklake_", 9) == 0 &&
+        classForm->relkind == RELKIND_RELATION) {
+      found = true;
+      break;
+    }
   }
 
   systable_endscan(scan);

@@ -1,10 +1,12 @@
 #pragma once
 
-#include <duckdb/common/error_data.hpp>
 
 extern "C" {
 #include "postgres.h"
+
+#include "miscadmin.h"
 }
+#include <duckdb/common/error_data.hpp>
 
 namespace pgducklake {
 
@@ -83,6 +85,18 @@ __CPPFunctionGuard__(const char *func_name, const char *file_name, int line,
   }
   pg_unreachable();
 }
+
+struct PostgresScopedStackReset {
+  PostgresScopedStackReset() : saved_current_stack(set_stack_base()) {}
+
+  ~PostgresScopedStackReset() { restore_stack_base(saved_current_stack); }
+  pg_stack_base_t saved_current_stack;
+
+private:
+  PostgresScopedStackReset(const PostgresScopedStackReset &) = delete;
+  PostgresScopedStackReset &
+  operator=(const PostgresScopedStackReset &) = delete;
+};
 
 } // namespace pgducklake
 
