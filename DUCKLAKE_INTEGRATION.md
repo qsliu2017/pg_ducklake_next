@@ -246,22 +246,181 @@ extern "C" {
 
 ---
 
+### Approach 5: Statically Embed Ducklake in the PG Extension
+
+**Status**: 🔧 Prototype — Build setup ready, requires pg_duckdb + DuckDB to be built first
+
+This approach compiles ducklake's C++ source directly into `pg_ducklake_next.so`, then registers it with DuckDB at runtime using DuckDB's `LoadStaticExtension<T>()` template. The result mirrors the ducklake-on-DuckDB relationship: **pg_ducklake is to pg_duckdb as ducklake is to DuckDB**.
+
+#### Architecture
+
+```
+pg_ducklake_next.so
+├── src/pg_ducklake_pg.cpp          PostgreSQL side (includes postgres.h)
+│   └── _PG_init(), SQL functions, SPI calls
+│   └── calls ducklake_ensure_loaded() via C linkage
+│
+├── src/pg_ducklake_duckdb.cpp      DuckDB side (includes duckdb.hpp + ducklake headers)
+│   └── ducklake_ensure_loaded():
+│          db.LoadStaticExtension<DucklakeExtension>()
+│
+├── ducklake sources (compiled in)  All 49 .cpp files from third_party/ducklake/src/
+│   └── ducklake_extension.cpp, ducklake_catalog.cpp, ...
+│
+└── include/pg_ducklake_bridge.h    Pure C bridge header (no PG or DuckDB includes)
+    └── extern "C" void ducklake_ensure_loaded(void);
+```
+
+#### The Separate Translation Unit Pattern
+
+PostgreSQL and DuckDB headers cannot coexist in the same translation unit due to macro conflicts (`FATAL`, `ERROR`, `Min`, `Max`, etc.). The solution: never mix them.
+
+| File | Includes postgres.h | Includes duckdb.hpp | Purpose |
+|------|:---:|:---:|---------|
+| `src/pg_ducklake_pg.cpp` | Yes | No | PostgreSQL extension interface |
+| `src/pg_ducklake_duckdb.cpp` | No | Yes | DuckDB/ducklake registration |
+| `include/pg_ducklake_bridge.h` | No | No | `extern "C"` bridge declarations |
+| `third_party/ducklake/src/*.cpp` | No | Yes | Ducklake implementation |
+
+#### Key API: `DuckDB::LoadStaticExtension<T>()`
+
+DuckDB provides a template method designed for exactly this use case (`duckdb/main/database.hpp:115`):
+
+```cpp
+template <class T>
+void LoadStaticExtension() {
+    T extension;
+    auto &manager = ExtensionManager::Get(*instance);
+    auto info = manager.BeginLoad(extension.Name());
+    if (!info) return; // already loaded — idempotent
+    ExtensionLoader loader(*instance, extension.Name());
+    extension.Load(loader);
+    loader.FinalizeLoad();
+    ExtensionInstallInfo install_info;
+    install_info.mode = ExtensionInstallMode::STATICALLY_LINKED;
+    install_info.version = extension.Version();
+    info->FinishLoad(install_info);
+}
+```
+
+Since `DuckDB` is a friend of `ExtensionLoader`, it can call the private `FinalizeLoad()`. The call is idempotent — safe to call multiple times.
+
+#### Registration Code
+
+In `src/pg_ducklake_duckdb.cpp` (DuckDB-only translation unit):
+
+```cpp
+#include "duckdb.hpp"
+#include "pgduckdb/pgduckdb_duckdb.hpp"
+#include "ducklake_extension.hpp"
+
+extern "C" void ducklake_ensure_loaded(void) {
+    auto &db = pgduckdb::DuckDBManager::Get().GetDatabase();
+    db.LoadStaticExtension<duckdb::DucklakeExtension>();
+}
+```
+
+In `src/pg_ducklake_pg.cpp` (PostgreSQL-only translation unit):
+
+```cpp
+extern "C" {
+#include "postgres.h"
+// ... PostgreSQL headers ...
+}
+#include "pg_ducklake_bridge.h"  // extern "C" void ducklake_ensure_loaded(void);
+
+// Called before any ducklake operation
+static void EnsureDucklake(void) {
+    ducklake_ensure_loaded();  // idempotent
+}
+```
+
+#### Why This Works
+
+1. **Symbol visibility**: pg_duckdb does NOT compile with `-fvisibility=hidden` on its own code. `DuckDBManager::Get()` and `GetDatabase()` are inline methods in the public header — they instantiate in our translation unit and reference pg_duckdb's `manager_instance` static member via dynamic linking.
+
+2. **No header conflicts**: Strict TU separation ensures PostgreSQL macros never contaminate DuckDB translation units and vice versa.
+
+3. **Same DuckDB instance**: `DuckDBManager::Get().GetDatabase()` returns pg_duckdb's singleton DuckDB instance. Ducklake registers its storage extension, functions, and types directly into that instance.
+
+4. **Template instantiation**: `LoadStaticExtension<DucklakeExtension>()` is instantiated in our TU. Since `DuckDB` is a friend of `ExtensionLoader`, `FinalizeLoad()` is accessible. The template uses only DuckDB public headers.
+
+5. **Idempotent**: `BeginLoad` returns `nullptr` if the extension is already loaded, making `ducklake_ensure_loaded()` safe to call from multiple code paths.
+
+#### Build Requirements
+
+The Makefile must handle two distinct compilation contexts:
+
+```makefile
+# PostgreSQL-facing files: include PG headers, no DuckDB headers
+src/pg_ducklake_pg.o: PG_CPPFLAGS = -Iinclude
+src/pg_ducklake_pg.o: PG_CXXFLAGS = -std=c++17
+
+# DuckDB-facing files: include DuckDB + ducklake headers, no PG headers
+DUCKDB_INCLUDES = -isystem third_party/pg_duckdb/third_party/duckdb/src/include \
+                  -I third_party/pg_duckdb/include \
+                  -I third_party/ducklake/src/include
+src/pg_ducklake_duckdb.o: override CXXFLAGS = $(DUCKDB_INCLUDES) -std=c++17
+```
+
+Ducklake's 49 source files compile with DuckDB include paths only, then all object files link into a single `pg_ducklake_next.so`.
+
+#### Hard Requirements
+
+| Requirement | Why |
+|-------------|-----|
+| ABI compatibility | Ducklake must compile against the **exact same DuckDB headers** as pg_duckdb. Different versions = undefined behavior. |
+| pg_duckdb built first | Need libduckdb and pg_duckdb's include headers available |
+| Submodule versions pinned | `third_party/pg_duckdb` and `third_party/ducklake` must target the same DuckDB version |
+| macOS: `-undefined,dynamic_lookup` | pg_duckdb symbols resolved at load time |
+| Linux: may need `-Wl,--unresolved-symbols=ignore-in-shared-libs` | Same purpose on Linux |
+
+#### Risks
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| DuckDB version mismatch between pg_duckdb and ducklake | High | Pin both submodules to the same DuckDB version. Verify at build time. |
+| pg_duckdb changes `DuckDBManager` API | Medium | Only `Get()` and `GetDatabase()` are used — small surface. |
+| Build complexity (49 extra source files) | Medium | Wildcard `$(wildcard third_party/ducklake/src/**/*.cpp)` in Makefile |
+| Binary size increase | Low | Ducklake adds ~2-3 MB of object code |
+| Initialization timing | Low | `DuckDBManager::Get()` uses lazy init; safe from SQL function context |
+
+**Pros**:
+- Full C++ API access to ducklake — can call `DuckLakeMetadataManager::Register` and any other symbol
+- No internet dependency (no downloading from community repo)
+- No pg_duckdb rebuild required
+- Mirrors the ducklake-on-DuckDB architecture naturally
+- Header conflicts solved cleanly via separate TUs
+- Uses DuckDB's official `LoadStaticExtension` API
+
+**Cons**:
+- Tight version coupling to DuckDB's ABI (same as Approach 2, but without rebuilding DuckDB)
+- Build complexity: must compile 49 extra C++ files with correct include paths
+- Larger binary than Approach 1
+
+**Use Case**: When you want pg_ducklake to be a "thick" extension that owns the ducklake lifecycle, has full C++ API access, and doesn't depend on downloading extensions at runtime.
+
+---
+
 ## Recommendation
 
-**For standard use cases**: Use Approach 1 (SQL Interface). This is what pg_mooncake does in production — install the DuckDB extension from a repository at SQL time, interact entirely through SQL.
+**For a thick extension with full ducklake control**: Use Approach 5 (Embedded). This gives full C++ API access, no internet dependency, and mirrors the ducklake-on-DuckDB architecture. The cost is build complexity and ABI coupling.
+
+**For a thin extension with minimal coupling**: Use Approach 1 (SQL Interface). This is what pg_mooncake does in production — install the DuckDB extension from a repository at SQL time, interact entirely through SQL.
 
 **If you need reverse callbacks** (DuckDB extension calling into PG extension): Use Approach 3, following pg_mooncake's `dlsym(RTLD_DEFAULT, ...)` pattern with `#[no_mangle] extern "C"` exports.
 
-**If you need full C++ API access** to ducklake internals: Use Approach 2, but understand the build complexity and maintenance cost. pg_mooncake explicitly avoided this path.
+**If you need full C++ API access but want to stay in DuckDB's build**: Use Approach 2, but understand the pg_duckdb rebuild cost. pg_mooncake explicitly avoided this path.
 
 ## Summary Table
 
-| Approach | Complexity | C++ API Access | Header Conflicts | pg_mooncake Uses? |
-|----------|-----------|---------------|-----------------|-------------------|
-| 1. SQL Interface | Low | No | None | Yes (primary) |
-| 2. Static into DuckDB | High | Full | Must manage | No |
-| 3. C FFI + dlsym | Medium | Callbacks only | None | Yes (reverse calls) |
-| 4. Shared lib + C API | Medium-High | Via wrapper | None | No |
+| Approach | Complexity | C++ API Access | Header Conflicts | Internet Required | pg_duckdb Rebuild |
+|----------|-----------|---------------|-----------------|-------------------|-------------------|
+| 1. SQL Interface | Low | No | None | Yes (download) | No |
+| 2. Static into DuckDB | High | Full | Must manage | No | Yes |
+| 3. C FFI + dlsym | Medium | Callbacks only | None | Yes (download) | No |
+| 4. Shared lib + C API | Medium-High | Via wrapper | None | No | No |
+| 5. Embedded in PG ext | Medium | Full | None (separate TUs) | No | No |
 
 ## References
 
@@ -271,3 +430,7 @@ extern "C" {
 - pg_mooncake bootstrap SQL: `../pg_mooncake/src/sql/bootstrap.sql`
 - pg_duckdb symbol export: `../pg_mooncake/pg_duckdb/src/pgduckdb_table_am.cpp`
 - macOS dynamic lookup: `../pg_mooncake/.cargo/config.toml`
+- DuckDB `LoadStaticExtension<T>()`: `third_party/pg_duckdb/third_party/duckdb/src/include/duckdb/main/database.hpp:115`
+- DuckDB `ExtensionLoader` API: `third_party/pg_duckdb/third_party/duckdb/src/include/duckdb/main/extension/extension_loader.hpp`
+- Ducklake extension entry point: `third_party/ducklake/src/ducklake_extension.cpp`
+- pg_duckdb `DuckDBManager` singleton: `third_party/pg_duckdb/src/pgduckdb_duckdb.cpp:185-197`
