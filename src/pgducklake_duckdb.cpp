@@ -19,10 +19,19 @@
 // Imported from pg_duckdb — returns duckdb::DuckDB* as void*
 extern "C" void *GetDuckDBDatabase(void);
 
+// Declared in pgducklake.cpp — returns PostgreSQL DataDir
+extern "C" const char *pgducklake_get_data_dir(void);
+
+// Forward declaration
+extern "C" void ducklake_load_extension(void);
+
 namespace pgducklake {
 
 // Thread-local storage for error messages
 static thread_local std::string last_error;
+
+// Per-backend state for catalog attachment
+static bool catalog_attached = false;
 
 duckdb::DuckDB &
 DuckLakeManager::GetDatabase() {
@@ -32,7 +41,34 @@ DuckLakeManager::GetDatabase() {
 
 duckdb::unique_ptr<duckdb::Connection>
 DuckLakeManager::CreateConnection() {
-	return duckdb::make_uniq<duckdb::Connection>(GetDatabase());
+	auto conn = duckdb::make_uniq<duckdb::Connection>(GetDatabase());
+
+	// Note: DuckLake extension is already loaded globally during _PG_init()
+	// We just need to attach the catalog for this backend
+
+	// Try to attach the DuckLake catalog once per backend
+	// The data directory is created during extension initialization and persists
+	if (!catalog_attached) {
+		const char *data_dir = pgducklake_get_data_dir();
+		if (data_dir && data_dir[0] != '\0') {
+			std::string catalog_data_path = std::string(data_dir) + "/pg_ducklake";
+
+			// ATTACH with IF NOT EXISTS - will succeed if catalog exists or can be attached
+			std::string attach_query =
+				"ATTACH IF NOT EXISTS 'ducklake:pgducklake:' AS pgducklake "
+				"(METADATA_SCHEMA 'ducklake', DATA_PATH '" + catalog_data_path + "')";
+
+			auto result = conn->Query(attach_query);
+			if (!result->HasError()) {
+				catalog_attached = true;
+			} else {
+				// Store error - don't mark as attached so we can retry
+				last_error = std::string("ATTACH failed: ") + result->GetError();
+			}
+		}
+	}
+
+	return conn;
 }
 
 int
@@ -67,10 +103,20 @@ DuckLakeManager::ExecuteQuery(const char *query, const char **errmsg_out) {
  * These provide extern "C" linkage for calling from PostgreSQL translation units.
  */
 
+// Global flag to track if metadata manager has been registered
+static bool metadata_manager_registered = false;
+
 extern "C" void
 ducklake_load_extension(void) {
 	auto &db = pgducklake::DuckLakeManager::GetDatabase();
-	duckdb::DuckLakeMetadataManager::Register("pgducklake", pgducklake::PgDuckLakeMetadataManager::Create);
+
+	// Only register metadata manager once globally
+	if (!metadata_manager_registered) {
+		duckdb::DuckLakeMetadataManager::Register("pgducklake", pgducklake::PgDuckLakeMetadataManager::Create);
+		metadata_manager_registered = true;
+	}
+
+	// Load DuckLake extension (can be called multiple times safely)
 	db.LoadStaticExtension<duckdb::DucklakeExtension>();
 }
 

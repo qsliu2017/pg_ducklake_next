@@ -76,7 +76,7 @@ make clean-regression
 
 ### The Split Translation Unit Pattern
 
-PostgreSQL and DuckDB headers cannot coexist in the same translation unit due to macro conflicts (`FATAL`, `ERROR`, `Min`, `Max`, etc.). The solution: **never mix them**.
+PostgreSQL and DuckDB headers cannot coexist in the same translation unit due to macro conflicts (`FATAL`, `ERROR`, `Min`, `Max`, etc.). The solution: **strict include ordering**.
 
 | File | Includes postgres.h | Includes duckdb.hpp | Purpose |
 |------|:---:|:---:|---------|
@@ -84,8 +84,55 @@ PostgreSQL and DuckDB headers cannot coexist in the same translation unit due to
 | `src/pgducklake_table_am.cpp` | Yes | No | Table access method (declares RegisterDuckdbTableAm locally) |
 | `src/pgducklake_ddl.cpp` | Yes | Yes | DDL operations (uses DuckLakeManager API, careful include order) |
 | `src/pgducklake_metadata_manager.cpp` | Yes | Yes | Metadata manager (uses careful include order) |
+| `src/pgducklake_pg_types.cpp` | Yes | Yes | Type conversion utilities (vendored, careful include order) |
 | `src/pgducklake_duckdb.cpp` | No | Yes | DuckDB bridge (DuckLakeManager implementation) |
 | `include/pgducklake/pgducklake_duckdb.hpp` | No | Yes | DuckLakeManager C++ API |
+
+### Critical Include Order Rule
+
+**All `.cpp` files MUST follow this include order** to avoid macro conflicts:
+
+```cpp
+// 1. DuckDB headers (if needed)
+#include "duckdb/common/types.hpp"
+#include "duckdb/main/connection.hpp"
+// ... other DuckDB headers
+
+// 2. DuckLake headers (if needed)
+#include "storage/ducklake_transaction.hpp"
+#include "common/ducklake_util.hpp"
+// ... other DuckLake headers
+
+// 3. Local project headers
+#include "pgducklake/pgducklake_duckdb.hpp"
+#include "pgducklake/pgducklake_pg_types.hpp"
+// ... other pgducklake headers
+
+// 4. PostgreSQL headers LAST (always in extern "C" block)
+extern "C" {
+#include "postgres.h"
+#include "catalog/pg_type.h"
+#include "utils/builtins.h"
+// ... other PostgreSQL headers
+}
+```
+
+**Why this order:**
+- DuckDB defines macros like `FATAL`, `ERROR` that conflict with PostgreSQL
+- PostgreSQL headers must come last so their macro definitions take precedence
+- `extern "C"` block prevents C++ name mangling for PostgreSQL C symbols
+- Violating this order results in compilation errors or undefined behavior
+
+**Never do this:**
+```cpp
+// WRONG - PostgreSQL headers before DuckDB
+#include "postgres.h"
+#include "duckdb.hpp"  // ERROR: macro conflicts
+
+// WRONG - Missing extern "C"
+#include "duckdb.hpp"
+#include "postgres.h"  // ERROR: C++ tries to mangle C symbols
+```
 
 ### Component Relationships
 
@@ -118,6 +165,19 @@ pg_ducklake.so
 
 4. **Static Extension Loading**: DuckLake is loaded during `_PG_init()` using DuckDB's `LoadStaticExtension<DucklakeExtension>()` template. This happens once during `CREATE EXTENSION pg_ducklake`, ensuring DuckLake is immediately available after installation.
 
+5. **Vendored Type Conversion**: Rather than linking against pg_duckdb's type conversion utilities (which creates dependency cascades and header conflicts), we vendor minimal type conversion code. The vendored utilities in `src/pgducklake_pg_types.cpp` provide:
+   - `DetoastPostgresDatum()` - Detoasts PostgreSQL varlena values
+   - `ConvertPostgresToDuckValue()` - Converts PostgreSQL Datum to DuckDB Vector
+   - `ConvertPostgresToDuckColumnType()` - Maps PostgreSQL types to DuckDB LogicalTypes
+
+   This approach avoids:
+   - Dependency cascades (pg_duckdb object files pull in many transitive dependencies)
+   - Header conflicts (pg_duckdb headers use guards preventing mixing with PostgreSQL headers)
+   - Symbol resolution complexity
+   - Build fragility
+
+   The vendored code (~300 lines) is well-understood type mapping logic that rarely changes.
+
 ## File Structure
 
 ### Core Implementation
@@ -126,10 +186,12 @@ pg_ducklake.so
 - `src/pgducklake_table_am.cpp` - Table access method handler (`CREATE ACCESS METHOD ducklake`)
 - `src/pgducklake_metadata_manager.cpp` - Custom metadata manager using PostgreSQL SPI
 - `src/pgducklake_ddl.cpp` - DDL event trigger handlers (CREATE/DROP TABLE)
+- `src/pgducklake_pg_types.cpp` - Vendored type conversion utilities (PostgreSQL ↔ DuckDB)
 
 ### Headers
 - `include/pgducklake/pgducklake_duckdb.hpp` - DuckLakeManager C++ API for DuckDB operations
 - `include/pgducklake/pgducklake_metadata_manager.hpp` - Metadata manager interface
+- `include/pgducklake/pgducklake_pg_types.hpp` - Type conversion utilities (vendored from pg_duckdb)
 - `include/pgducklake/pgducklake_defs.hpp` - Shared constants
 - `include/pgducklake/utility/cpp_wrapper.hpp` - PostgreSQL/C++ interop utilities
 
@@ -188,8 +250,14 @@ SHLIB_LINK += -Wl,-undefined,dynamic_lookup  # macOS
 
 3. **Metadata manager changes** (query routing, type conversion):
    - Edit `src/pgducklake_metadata_manager.cpp`
-   - This carefully includes both PostgreSQL and DuckDB headers
-   - DuckDB headers must come **before** PostgreSQL headers to avoid macro conflicts
+   - **CRITICAL**: Follow the include order rule (DuckDB → DuckLake → Local → PostgreSQL)
+   - Uses vendored type conversion from `pgducklake/pgducklake_pg_types.hpp`
+
+4. **Type conversion utilities** (PostgreSQL ↔ DuckDB type mapping):
+   - Edit `src/pgducklake_pg_types.cpp`
+   - **CRITICAL**: Follow the include order rule (DuckDB → DuckLake → Local → PostgreSQL)
+   - Vendored from pg_duckdb to avoid dependency issues
+   - Supports common types: integers, floats, text, dates, timestamps, UUID, JSON, arrays
 
 ### Adding New Functionality
 
@@ -211,7 +279,7 @@ When adding new DuckLake operations:
 
 ### Common Pitfalls
 
-1. **Including both postgres.h and duckdb.hpp in the same TU**: Results in macro conflicts. Use separate translation units.
+1. **Wrong include order**: PostgreSQL headers MUST come last (after DuckDB/DuckLake/local headers). Violating the include order causes macro conflicts (`FATAL`, `ERROR`, `Min`, `Max`). See "Critical Include Order Rule" above.
 
 2. **Forgetting to build ducklake static library**: Run `make ducklake` before `make`. The Makefile has dependencies but sometimes manual intervention helps.
 
@@ -220,6 +288,8 @@ When adding new DuckLake operations:
 4. **Missing shared_preload_libraries**: pg_duckdb must be loaded at server start via `shared_preload_libraries = 'pg_duckdb'` in postgresql.conf. Otherwise `GetDuckDBDatabase()` will fail.
 
 5. **Not force-loading DuckLake**: Without `-Wl,-force_load` (macOS) or `--whole-archive` (Linux), the linker drops unreferenced DuckLake symbols, causing `LoadStaticExtension<T>()` to fail.
+
+6. **Trying to link pg_duckdb utilities directly**: Don't try to link against pg_duckdb's `.o` files for type conversion. This creates dependency cascades (pgduckdb_types.o → pgduckdb_guc.o → DuckDBManager → ...). Use the vendored utilities in `src/pgducklake_pg_types.cpp` instead.
 
 ## SQL Functions and Features
 
@@ -298,6 +368,45 @@ The `GenerateCreateTableDDL()` function:
 6. Returns DDL string for execution
 
 This approach avoids dependency on pg_duckdb's internal table definition parsing and keeps the code simple and maintainable.
+
+### Vendored Type Conversion
+
+The metadata manager needs to convert PostgreSQL data to DuckDB format when executing metadata queries through SPI. Rather than depending on pg_duckdb's type conversion utilities (which would create build complexity and dependency cascades), we vendor minimal type conversion code.
+
+**Why vendoring instead of linking:**
+1. **Header conflicts**: pg_duckdb headers include `cpp_only_file.hpp` which statically asserts that `postgres.h` is not included. The metadata manager needs both.
+2. **Dependency cascade**: Linking `pgduckdb_types.o` requires `pgduckdb_guc.o`, which requires `DuckDBManager`, which requires more dependencies...
+3. **Symbol visibility**: pg_duckdb uses `-fvisibility=hidden` for C++ symbols, making direct linking fragile.
+4. **Build simplicity**: Vendoring ~300 lines of well-understood type mapping code is simpler than managing complex linking dependencies.
+
+**Vendored functions** (in `src/pgducklake_pg_types.cpp`):
+- `DetoastPostgresDatum()` - Handles PostgreSQL TOAST (The Oversized-Attribute Storage Technique)
+  - Expands compressed values
+  - Fetches externally stored values
+  - Handles short varlena format
+  - Returns detoasted value and whether caller should free it
+
+- `ConvertPostgresToDuckValue()` - Converts PostgreSQL Datum to DuckDB Vector
+  - Supports: bool, int2/4/8, float4/8, numeric, text/varchar, date, timestamp, UUID, JSON
+  - Handles PostgreSQL epoch offset (2000-01-01 vs DuckDB's 1970-01-01)
+  - Falls back to string representation for unsupported types
+
+- `ConvertPostgresToDuckColumnType()` - Maps PostgreSQL column types to DuckDB LogicalType
+  - Introspects PostgreSQL type system using `get_element_type()`
+  - Maps arrays to DuckDB LIST types
+  - Handles multi-dimensional arrays via `attndims`
+
+**The Critical Include Order Rule applies** (see Architecture section above):
+1. DuckDB headers first (defines types like `duckdb::Vector`, `duckdb::LogicalType`)
+2. DuckLake headers (if needed)
+3. Local pgducklake headers (including `pgducklake/pgducklake_pg_types.hpp`)
+4. PostgreSQL headers LAST in `extern "C"` block
+
+This ordering ensures:
+- DuckDB types are defined before our conversion functions need them
+- PostgreSQL headers come after everything else to avoid macro pollution
+- No pg_duckdb headers are included (avoiding the `cpp_only_file.hpp` assertion)
+- All C symbols from PostgreSQL are correctly handled via `extern "C"`
 
 ## Key Technical Details
 

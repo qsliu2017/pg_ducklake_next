@@ -1,5 +1,6 @@
 #include "pgducklake/pgducklake_metadata_manager.hpp"
 
+// DuckDB headers first
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/enums/statement_type.hpp"
 #include "duckdb/common/exception.hpp"
@@ -9,12 +10,14 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/materialized_query_result.hpp"
-
-#include "common/ducklake_util.hpp"
-#include "pgducklake/utility/cpp_wrapper.hpp"
-#include <cstring>
 #include <duckdb/common/string_util.hpp>
 
+#include "common/ducklake_util.hpp"
+
+// Our vendored type conversion utilities
+#include "pgducklake/pgducklake_pg_types.hpp"
+
+// PostgreSQL headers
 extern "C" {
 #include "postgres.h"
 
@@ -30,6 +33,10 @@ extern "C" {
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 }
+
+// Include after PostgreSQL headers (since it also includes postgres.h)
+#include "pgducklake/utility/cpp_wrapper.hpp"
+#include <cstring>
 
 namespace pgducklake {
 static duckdb::StatementType ConvertSPIResultToDuckStatementType(int result) {
@@ -87,7 +94,7 @@ static void InsertSPITupleTableIntoChunk(duckdb::DataChunk &output,
           ConvertPostgresToDuckValue(attr->atttypid, detoasted_value, result,
                                      row);
           if (should_free) {
-            duckdb_free(reinterpret_cast<void *>(detoasted_value));
+            pfree(DatumGetPointer(detoasted_value));
           }
         } else {
           ConvertPostgresToDuckValue(attr->atttypid, datum, result, row);

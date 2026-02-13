@@ -20,6 +20,9 @@ namespace pgducklake {
  *
  * Note: DuckLake extension is loaded during _PG_init(), so it's already
  * available when you use this class.
+ *
+ * Catalog Auto-Attachment: The DuckLake catalog at $DATADIR/pg_ducklake
+ * is automatically attached for every new connection created via CreateConnection().
  */
 class DuckLakeManager {
 public:
@@ -32,6 +35,7 @@ public:
 	/**
 	 * Create a new connection to the DuckDB database.
 	 * Each connection maintains its own transaction state.
+	 * Auto-attaches the DuckLake catalog if configured via SetCatalogDataPath().
 	 */
 	static duckdb::unique_ptr<duckdb::Connection> CreateConnection();
 

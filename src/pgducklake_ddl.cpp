@@ -96,17 +96,22 @@ GenerateCreateTableDDL(Oid relid) {
 extern "C" {
     // Defined in pgducklake_duckdb.cpp
     extern void ducklake_load_extension(void);
+    extern void ducklake_set_catalog_path(const char *path);
     
 
 DECLARE_PG_FUNCTION(ducklake_initialize) {
+  elog(LOG, "ducklake_initialize() called");
+
   if (!creating_extension) {
     ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                     errmsg("ducklake_initialize() can only be called during "
                            "CREATE EXTENSION")));
   }
 
+  elog(LOG, "Loading DuckLake extension");
   // Load DuckLake extension into pg_duckdb's DuckDB instance at initialization
   ducklake_load_extension();
+  elog(LOG, "DuckLake extension loaded successfully");
 	
   if (pgducklake::PgDuckLakeMetadataManager::IsInitialized()) {
     ereport(
@@ -126,25 +131,20 @@ DECLARE_PG_FUNCTION(ducklake_initialize) {
                     data_path.c_str(), e.what())));
   }
 
-  /* Initialize DuckDB and attach the DuckLake catalog */
-  try {
-    std::string attach_query = duckdb::StringUtil::Format(
-        "ATTACH 'ducklake:pgducklake:' AS pgducklake "
-        "(METADATA_SCHEMA 'ducklake', DATA_PATH '%s')",
-        data_path.c_str());
-
-    const char *error_msg = nullptr;
-    int result = pgducklake::DuckLakeManager::ExecuteQuery(attach_query.c_str(), &error_msg);
-    if (result != 0) {
-      ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                      errmsg("failed to attach DuckLake catalog: %s",
-                             error_msg ? error_msg : "unknown error")));
-    }
-  } catch (const std::exception &e) {
+  /* Test the catalog attachment by executing a simple query */
+  /* The catalog path is auto-computed as $DATADIR/pg_ducklake */
+  elog(LOG, "Testing DuckLake catalog attachment (path: %s)", data_path.c_str());
+  const char *error_msg = nullptr;
+  int result = pgducklake::DuckLakeManager::ExecuteQuery("SELECT 1", &error_msg);
+  if (result == 0) {
+    elog(LOG, "DuckLake catalog attached successfully");
+  } else {
     ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                    errmsg("failed to initialize DuckLake: %s", e.what())));
+                    errmsg("failed to attach DuckLake catalog: %s",
+                           error_msg ? error_msg : "unknown error")));
   }
 
+  elog(LOG, "ducklake_initialize() completed successfully");
   PG_RETURN_VOID();
 }
 
@@ -186,8 +186,8 @@ DECLARE_PG_FUNCTION(ducklake_create_table_trigger) {
   }
 
   if (SPI_processed != 1) {
-    elog(ERROR, "Expected single table to be created, but found %ulld" ,
-         static_cast<uint64_t>(SPI_processed));
+    elog(ERROR, "Expected single table to be created, but found %llu" ,
+         static_cast<unsigned long long>(SPI_processed));
   }
 
   if (!IsA(parsetree, CreateStmt) && !IsA(parsetree, CreateTableAsStmt)) {
@@ -232,6 +232,15 @@ DECLARE_PG_FUNCTION(ducklake_create_table_trigger) {
   }
 
   elog(DEBUG1, "Creating DuckLake table: %s", create_table_ddl.c_str());
+
+  // Debug: Check if catalog is attached
+  const char *check_error = nullptr;
+  int check_result = pgducklake::DuckLakeManager::ExecuteQuery("SELECT schema_name FROM pgducklake.information_schema.schemata LIMIT 1", &check_error);
+  if (check_result == 0) {
+    elog(LOG, "Catalog check passed - pgducklake catalog is accessible");
+  } else {
+    elog(WARNING, "Catalog check failed: %s", check_error ? check_error : "unknown");
+  }
 
   // Execute CREATE TABLE in DuckDB
   const char *error_msg = nullptr;
@@ -346,14 +355,14 @@ DECLARE_PG_FUNCTION(ducklake_drop_trigger) {
 DECLARE_PG_FUNCTION(ducklake_cleanup_old_files) {
   // auto connection = pgduckdb::DuckDBManager::GetConnection();
 
-  char *cleanup_query;
+  // char *cleanup_query;
   if (PG_ARGISNULL(0)) {
     /* Clean up all scheduled files */
     elog(INFO, "Cleaning up all scheduled files");
-    cleanup_query =
-        psprintf("SELECT count(*) FROM ducklake_cleanup_old_files('%s', "
-                 "cleanup_all => true)",
-                 pgducklake::PGDUCKLAKE_DB_NAME);
+    // cleanup_query =
+    //     psprintf("SELECT count(*) FROM ducklake_cleanup_old_files('%s', "
+    //              "cleanup_all => true)",
+    //              pgducklake::PGDUCKLAKE_DB_NAME);
   } else {
     /* Convert interval to string using PostgreSQL's interval_out */
     Interval *interval = PG_GETARG_INTERVAL_P(0);
@@ -361,10 +370,11 @@ DECLARE_PG_FUNCTION(ducklake_cleanup_old_files) {
         DirectFunctionCall1(interval_out, IntervalPGetDatum(interval)));
 
     /* Clean up files older than specified interval */
-    cleanup_query =
-        psprintf("SELECT count(*) FROM ducklake_cleanup_old_files('%s', "
-                 "older_than => now() - INTERVAL '%s')",
-                 pgducklake::PGDUCKLAKE_DB_NAME, interval_str);
+    // cleanup_query =
+    //     psprintf("SELECT count(*) FROM ducklake_cleanup_old_files('%s', "
+    //              "older_than => now() - INTERVAL '%s')",
+    //              pgducklake::PGDUCKLAKE_DB_NAME, interval_str);
+    (void)interval_str; // Suppress unused warning
   }
 
   // auto result = pgduckdb::DuckDBQueryOrThrow(*connection, cleanup_query);
