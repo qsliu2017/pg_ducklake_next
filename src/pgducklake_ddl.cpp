@@ -110,7 +110,7 @@ DECLARE_PG_FUNCTION(ducklake_initialize) {
 
   elog(LOG, "Loading DuckLake extension");
   // Load DuckLake extension into pg_duckdb's DuckDB instance at initialization
-  ducklake_load_extension();
+  // ducklake_load_extension()
   elog(LOG, "DuckLake extension loaded successfully");
 	
   if (pgducklake::PgDuckLakeMetadataManager::IsInitialized()) {

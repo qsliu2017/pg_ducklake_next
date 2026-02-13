@@ -140,10 +140,14 @@ extern "C" {
 pg_ducklake.so
 ├── PostgreSQL-facing code (src/pgducklake*.cpp)
 │   └── Implements table AM, DDL hooks, metadata operations
-│   └── _PG_init() calls ducklake_load_extension() at startup
+│   └── _PG_init():
+│          1. ducklake_init_extension() — registers metadata manager
+│          2. RegisterDuckdbLoadExtension(ducklake_load_extension) — deferred loading
 │
 ├── DuckDB bridge (src/pgducklake_duckdb.cpp)
-│   └── ducklake_load_extension():
+│   └── ducklake_init_extension():
+│          DuckLakeMetadataManager::Register("pgducklake", ...)
+│   └── ducklake_load_extension() (called by pg_duckdb when DuckDB is ready):
 │          GetDuckDBDatabase()->LoadStaticExtension<DucklakeExtension>()
 │   └── DuckLakeManager: high-level C++ API for DuckDB operations
 │
@@ -163,7 +167,7 @@ pg_ducklake.so
 
 3. **Dynamic Symbol Resolution**: Uses `-Wl,-undefined,dynamic_lookup` (macOS) to resolve pg_duckdb symbols at runtime. pg_duckdb must be loaded via `shared_preload_libraries`.
 
-4. **Static Extension Loading**: DuckLake is loaded during `_PG_init()` using DuckDB's `LoadStaticExtension<DucklakeExtension>()` template. This happens once during `CREATE EXTENSION pg_ducklake`, ensuring DuckLake is immediately available after installation.
+4. **Deferred Static Extension Loading**: During `_PG_init()`, the metadata manager is registered eagerly, and a callback is registered via pg_duckdb's `RegisterDuckdbLoadExtension()`. The actual `LoadStaticExtension<DucklakeExtension>()` call is deferred until pg_duckdb's `DuckDBManager::Initialize()` runs, ensuring the DuckDB instance is fully configured before extensions are loaded.
 
 5. **Vendored Type Conversion**: Rather than linking against pg_duckdb's type conversion utilities (which creates dependency cascades and header conflicts), we vendor minimal type conversion code. The vendored utilities in `src/pgducklake_pg_types.cpp` provide:
    - `DetoastPostgresDatum()` - Detoasts PostgreSQL varlena values
@@ -206,6 +210,35 @@ pg_ducklake.so
 - `test/regression/expected/` - Expected test output
 - `test/regression/schedule` - Test execution order
 - `test/regression/regression.conf` - PostgreSQL configuration for tests (enables pg_duckdb)
+
+## Upstream Submodule Strategy (`third_party/pg_duckdb`)
+
+`third_party/pg_duckdb` is an **upstream project** — we do not own it and want to minimize conflicts with upstream development. When pg_ducklake needs new capabilities from pg_duckdb, the approach is to **add hooks** rather than modify existing logic.
+
+### Principles
+
+1. **No invasive changes**: Never modify existing pg_duckdb functions or control flow. Add new, self-contained hook points instead.
+2. **Additive only**: New code should be small, isolated additions (a registration function + a callback loop) that don't touch existing behavior.
+3. **Upstream-friendly**: Design hooks so they could plausibly be upstreamed. Use `extern "C"` with `visibility("default")` so external extensions can consume them.
+4. **Zero impact when unused**: If no extensions register callbacks, the hook is a no-op (empty vector iteration).
+
+### Current Hooks
+
+**`RegisterDuckdbLoadExtension(callback)`** (in `src/pgduckdb_duckdb.cpp`):
+- Allows external extensions to register a loader function that pg_duckdb calls during `DuckDBManager::Initialize()`
+- Callbacks are stored in a static `std::vector<DuckDBLoadExtension>` and invoked after the DuckDB instance is fully configured
+- pg_ducklake uses this to defer `LoadStaticExtension<DucklakeExtension>()` until the DuckDB instance is ready
+- Added as ~15 lines: a typedef, a vector, a registration function, and a for-loop in `Initialize()`
+
+### How to Add New Hooks
+
+When pg_ducklake needs something new from pg_duckdb:
+
+1. Identify the minimal hook point needed (e.g., "call me after X happens")
+2. Add a registration function (`RegisterDuckdb<HookName>`) with `extern "C"` visibility in the relevant pg_duckdb source file
+3. Store callbacks in a static container and invoke them at the appropriate point
+4. In pg_ducklake, declare the registration function with `extern "C"` and call it during `_PG_init()`
+5. Keep the pg_duckdb diff as small as possible for easy rebasing against upstream
 
 ## Important Build Requirements
 
@@ -432,24 +465,45 @@ public:
 
 **Implementation details:**
 - Wraps pg_duckdb's low-level `GetDuckDBDatabase()` C function (returns `void*`)
-- DuckLake extension is loaded in `_PG_init()` during extension initialization
+- DuckLake extension loading is deferred via `RegisterDuckdbLoadExtension()` callback
 - Defined in `include/pgducklake/pgducklake_duckdb.hpp`, implemented in `src/pgducklake_duckdb.cpp`
 
-**Extension Lifecycle:**
+**Extension Lifecycle (Deferred Loading):**
+
+Extension initialization uses a two-phase approach to handle the timing constraint that `_PG_init()` runs before the DuckDB instance is fully initialized:
+
 ```
 1. LOAD 'pg_duckdb'              (via shared_preload_libraries)
-2. CREATE EXTENSION pg_ducklake  → _PG_init() → ducklake_load_extension()
-3. DuckLake is now registered with DuckDB's ExtensionManager
+2. CREATE EXTENSION pg_ducklake  → _PG_init():
+   a. ducklake_init_extension()  → Registers PgDuckLakeMetadataManager (no DuckDB instance needed)
+   b. RegisterDuckdbLoadExtension(ducklake_load_extension)  → Registers callback with pg_duckdb
+3. First query using DuckDB      → DuckDBManager::Initialize():
+   a. DuckDB instance fully configured
+   b. pg_duckdb invokes all registered callbacks
+   c. ducklake_load_extension() → db.LoadStaticExtension<DucklakeExtension>()
+4. DuckLake is now registered with DuckDB's ExtensionManager
 ```
+
+**Why deferred loading:**
+- `_PG_init()` runs when the shared library is loaded, but `GetDuckDBDatabase()` may not return a fully initialized instance yet
+- The metadata manager registration (`DuckLakeMetadataManager::Register`) is safe to call eagerly because it doesn't need a DuckDB instance
+- The static extension loading (`LoadStaticExtension<T>()`) requires a fully initialized DuckDB instance, so it's deferred via the callback mechanism
+- pg_duckdb's `RegisterDuckdbLoadExtension()` stores the callback and invokes it during `DuckDBManager::Initialize()`, after all DuckDB configuration is applied
+
+**Key functions:**
+- `ducklake_init_extension()` — Called once during `_PG_init()`. Registers the custom metadata manager globally.
+- `ducklake_load_extension()` — Called by pg_duckdb during `DuckDBManager::Initialize()`. Loads the DuckLake static extension into the DuckDB instance.
 
 ### Symbol Visibility
 
 pg_duckdb exports a minimal C interface:
 - `GetDuckDBDatabase()` - Returns `duckdb::DuckDB*` as `void*`
 - `RegisterDuckdbTableAm()` - Registers custom table access methods
+- `RegisterDuckdbLoadExtension()` - Registers a callback to be invoked when a new DuckDB backend is created (used for deferred extension loading)
 
 All C++ symbols in the `pgduckdb::` namespace are hidden (`-fvisibility=hidden`). This extension:
 1. Imports `GetDuckDBDatabase()` in the DuckDB-facing translation unit (`src/pgducklake_duckdb.cpp`)
 2. Declares `RegisterDuckdbTableAm()` locally in the one file that needs it (`src/pgducklake_table_am.cpp`)
-3. Wraps `GetDuckDBDatabase()` with `DuckLakeManager` to provide type-safe, high-level APIs
-4. Never exposes raw pg_duckdb symbols via headers
+3. Declares `RegisterDuckdbLoadExtension()` in `src/pgducklake.cpp` to register the deferred loader
+4. Wraps `GetDuckDBDatabase()` with `DuckLakeManager` to provide type-safe, high-level APIs
+5. Never exposes raw pg_duckdb symbols via headers

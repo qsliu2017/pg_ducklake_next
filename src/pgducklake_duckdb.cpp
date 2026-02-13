@@ -22,7 +22,10 @@ extern "C" void *GetDuckDBDatabase(void);
 // Declared in pgducklake.cpp — returns PostgreSQL DataDir
 extern "C" const char *pgducklake_get_data_dir(void);
 
-// Forward declaration
+// Called once
+extern "C" void ducklake_init_extension(void);
+
+// Called every time a new duckdb backend is created
 extern "C" void ducklake_load_extension(void);
 
 namespace pgducklake {
@@ -103,18 +106,14 @@ DuckLakeManager::ExecuteQuery(const char *query, const char **errmsg_out) {
  * These provide extern "C" linkage for calling from PostgreSQL translation units.
  */
 
-// Global flag to track if metadata manager has been registered
-static bool metadata_manager_registered = false;
+extern "C" void
+ducklake_init_extension(void){
+    duckdb::DuckLakeMetadataManager::Register("pgducklake", pgducklake::PgDuckLakeMetadataManager::Create);
+}
 
 extern "C" void
 ducklake_load_extension(void) {
 	auto &db = pgducklake::DuckLakeManager::GetDatabase();
-
-	// Only register metadata manager once globally
-	if (!metadata_manager_registered) {
-		duckdb::DuckLakeMetadataManager::Register("pgducklake", pgducklake::PgDuckLakeMetadataManager::Create);
-		metadata_manager_registered = true;
-	}
 
 	// Load DuckLake extension (can be called multiple times safely)
 	db.LoadStaticExtension<duckdb::DucklakeExtension>();
