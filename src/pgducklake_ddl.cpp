@@ -1,9 +1,9 @@
 #include "pgducklake/pgducklake_defs.hpp"
-#include "pgducklake/pgducklake_duckdb.hpp"
 #include "pgducklake/pgducklake_metadata_manager.hpp"
 #include "pgducklake/utility/cpp_wrapper.hpp"
 
-#include <duckdb/main/database.hpp>
+#include <duckdb/common/string_util.hpp>
+#include <duckdb/parser/keyword_helper.hpp>
 #include <filesystem>
 
 extern "C" {
@@ -19,6 +19,8 @@ extern "C" {
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "nodes/value.h"
+#include "parser/parse_func.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
@@ -32,6 +34,74 @@ extern "C" {
 namespace pgduckdb {
 bool ducklake_ctas_skip_data = false;
 } // namespace pgduckdb
+
+/*
+ * Look up the OID of duckdb.raw_query(text), cached per backend.
+ */
+static Oid
+GetRawQueryFuncOid() {
+  static Oid cached = InvalidOid;
+  if (!OidIsValid(cached)) {
+    List *funcname = list_make2(makeString(pstrdup("duckdb")),
+                                makeString(pstrdup("raw_query")));
+    Oid argtypes[] = {TEXTOID};
+    cached = LookupFuncName(funcname, 1, argtypes, false);
+    list_free(funcname);
+  }
+  return cached;
+}
+
+/*
+ * Call duckdb.raw_query() with NOTICE messages suppressed.
+ * raw_query always emits elog(NOTICE, "result: ...") which is noisy.
+ */
+static void
+DuckdbRawQuery(const char *query) {
+  int save_nestlevel = NewGUCNestLevel();
+  SetConfigOption("client_min_messages", "warning", PGC_USERSET,
+                  PGC_S_SESSION);
+
+  OidFunctionCall1(GetRawQueryFuncOid(), CStringGetTextDatum(query));
+
+  AtEOXact_GUC(false, save_nestlevel);
+}
+
+/*
+ * Execute a DuckDB query via pg_duckdb's duckdb.raw_query() UDF.
+ * Ensures the DuckLake catalog is attached first.
+ *
+ * Returns 0 on success, 1 on error.
+ * On error, sets *errmsg_out to the error message (if non-null).
+ */
+int
+ExecuteDuckDBQuery(const char *query, const char **errmsg_out) {
+  static thread_local std::string last_error;
+
+  // Volatile to survive PG_CATCH longjmp
+  volatile int result = 0;
+  MemoryContext saved_context = CurrentMemoryContext;
+
+  PG_TRY();
+  {
+    DuckdbRawQuery(query);
+  }
+  PG_CATCH();
+  {
+    MemoryContextSwitchTo(saved_context);
+    ErrorData *edata = CopyErrorData();
+    FlushErrorState();
+
+    last_error = edata->message ? edata->message : "unknown error";
+    FreeErrorData(edata);
+
+    if (errmsg_out)
+      *errmsg_out = last_error.c_str();
+    result = 1;
+  }
+  PG_END_TRY();
+
+  return result;
+}
 
 // Helper function to generate CREATE TABLE DDL for DuckDB
 static std::string
@@ -94,10 +164,6 @@ GenerateCreateTableDDL(Oid relid) {
 }
 
 extern "C" {
-    // Defined in pgducklake_duckdb.cpp
-    extern void ducklake_load_extension(void);
-    extern void ducklake_set_catalog_path(const char *path);
-    
 
 DECLARE_PG_FUNCTION(ducklake_initialize) {
   elog(LOG, "ducklake_initialize() called");
@@ -108,43 +174,16 @@ DECLARE_PG_FUNCTION(ducklake_initialize) {
                            "CREATE EXTENSION")));
   }
 
-  elog(LOG, "Loading DuckLake extension");
-  // Load DuckLake extension into pg_duckdb's DuckDB instance at initialization
-  // ducklake_load_extension()
-  elog(LOG, "DuckLake extension loaded successfully");
-	
   if (pgducklake::PgDuckLakeMetadataManager::IsInitialized()) {
     ereport(
         ERROR,
         (errcode(ERRCODE_DUPLICATE_SCHEMA),
          errmsg("DuckLake reserved schema \"ducklake\" is already in use")));
   }
+  
+  // force creating DuckDB instance
+  ExecuteDuckDBQuery("SELECT 1", NULL);
 
-  /* Create the data directory for DuckLake parquet files */
-  auto data_path = duckdb::StringUtil::Format("%s/pg_ducklake", DataDir);
-  try {
-    std::filesystem::create_directory(data_path);
-  } catch (const std::filesystem::filesystem_error &e) {
-    ereport(ERROR,
-            (errcode(ERRCODE_IO_ERROR),
-             errmsg("failed to create DuckLake data directory \"%s\": %s",
-                    data_path.c_str(), e.what())));
-  }
-
-  /* Test the catalog attachment by executing a simple query */
-  /* The catalog path is auto-computed as $DATADIR/pg_ducklake */
-  elog(LOG, "Testing DuckLake catalog attachment (path: %s)", data_path.c_str());
-  const char *error_msg = nullptr;
-  int result = pgducklake::DuckLakeManager::ExecuteQuery("SELECT 1", &error_msg);
-  if (result == 0) {
-    elog(LOG, "DuckLake catalog attached successfully");
-  } else {
-    ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                    errmsg("failed to attach DuckLake catalog: %s",
-                           error_msg ? error_msg : "unknown error")));
-  }
-
-  elog(LOG, "ducklake_initialize() completed successfully");
   PG_RETURN_VOID();
 }
 
@@ -233,18 +272,17 @@ DECLARE_PG_FUNCTION(ducklake_create_table_trigger) {
 
   elog(DEBUG1, "Creating DuckLake table: %s", create_table_ddl.c_str());
 
-  // Debug: Check if catalog is attached
-  const char *check_error = nullptr;
-  int check_result = pgducklake::DuckLakeManager::ExecuteQuery("SELECT schema_name FROM pgducklake.information_schema.schemata LIMIT 1", &check_error);
-  if (check_result == 0) {
-    elog(LOG, "Catalog check passed - pgducklake catalog is accessible");
-  } else {
-    elog(WARNING, "Catalog check failed: %s", check_error ? check_error : "unknown");
-  }
+  // Ensure the schema exists in the DuckLake catalog
+  const char *schema_name = get_namespace_name(get_rel_namespace(relid));
+  std::string create_schema_ddl = duckdb::StringUtil::Format(
+      "CREATE SCHEMA IF NOT EXISTS %s.%s",
+      pgducklake::PGDUCKLAKE_DB_NAME,
+      schema_name);
+  ExecuteDuckDBQuery(create_schema_ddl.c_str(), nullptr);
 
-  // Execute CREATE TABLE in DuckDB
+  // Execute CREATE TABLE in DuckDB via raw_query
   const char *error_msg = nullptr;
-  int result = pgducklake::DuckLakeManager::ExecuteQuery(create_table_ddl.c_str(), &error_msg);
+  int result = ExecuteDuckDBQuery(create_table_ddl.c_str(), &error_msg);
   if (result != 0) {
     ereport(ERROR,
             (errcode(ERRCODE_INTERNAL_ERROR),
@@ -328,7 +366,7 @@ DECLARE_PG_FUNCTION(ducklake_drop_trigger) {
     elog(DEBUG1, "Dropping DuckLake table: %s", drop_ddl.c_str());
 
     const char *error_msg = nullptr;
-    int result = pgducklake::DuckLakeManager::ExecuteQuery(drop_ddl.c_str(), &error_msg);
+    int result = ExecuteDuckDBQuery(drop_ddl.c_str(), &error_msg);
     if (result != 0) {
       // Log warning but don't fail - table might already be gone
       elog(WARNING, "failed to drop DuckLake table %s.%s: %s",

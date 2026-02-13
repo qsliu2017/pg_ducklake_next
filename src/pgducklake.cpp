@@ -15,31 +15,18 @@ PG_MODULE_MAGIC_EXT(.name = "pg_duckdb", .version = PG_DUCKDB_VERSION);
 PG_MODULE_MAGIC;
 #endif
 
-// Forward declaration of C interface function
+// Forward declaration of C interface functions
 void ducklake_init_extension(void);
-void ducklake_load_extension(void);
-extern "C" {
-typedef void (*DuckDBLoadExtension)(void);
-}
-extern "C" bool
-RegisterDuckdbLoadExtension(DuckDBLoadExtension extension);
+void ducklake_load_extension(void *db, void *context);
 
-void
-_PG_init(void) {
-	// Load DuckLake extension into pg_duckdb's DuckDB instance
-	// This is called once per backend when the shared library is first loaded
+typedef void (*DuckDBLoadExtension)(void *db, void *context);
+bool RegisterDuckdbLoadExtension(DuckDBLoadExtension extension);
 
-	ducklake_init_extension();
-	RegisterDuckdbLoadExtension(ducklake_load_extension);
-}
-
-/*
- * Get PostgreSQL data directory path.
- * Can be called from DuckDB-facing code.
- */
-const char *
-pgducklake_get_data_dir(void) {
-	return DataDir;
+void _PG_init(void) {
+  // Register the DuckLake metadata manager (eager, no DuckDB instance needed)
+  ducklake_init_extension();
+  // Register callback for deferred static extension loading
+  RegisterDuckdbLoadExtension(ducklake_load_extension);
 }
 
 } // extern "C"
